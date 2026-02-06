@@ -14,6 +14,10 @@
 #include <algorithm>
 #include <set>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -24,6 +28,13 @@ const std::string LOG_FILE = "C:\\GateKeeper\\debug.log";
 
 // Global cache to track existing files across ALL scopes
 std::map<std::string, std::string> g_fileCache; // Path -> LastModified
+std::mutex g_cacheMutex; // Protects g_fileCache
+
+// Global cache for permissions to avoid redundant system calls
+std::map<std::string, bool> g_lockCache; // Path -> accessible
+std::mutex g_lockMutex; // Protects g_lockCache
+
+std::atomic<bool> g_running{ true };
 
 void LogMessage(const std::string& message) {
     try {
@@ -33,13 +44,11 @@ void LogMessage(const std::string& message) {
         std::ofstream logFile(LOG_FILE, std::ios::app);
         auto now = std::time(nullptr);
         auto tm = *std::localtime(&now);
-        std::cout << "[" << std::put_time(&tm, "%H:%M:%S") << "] " << message << std::endl;
+        // std::cout << "[" << std::put_time(&tm, "%H:%M:%S") << "] " << message << std::endl;
         if (logFile.is_open()) {
             logFile << "[" << std::put_time(&tm, "%H:%M:%S") << "] " << message << std::endl;
         }
-    } catch (...) {
-        std::cout << "LOG ERROR: " << message << std::endl;
-    }
+    } catch (...) {}
 }
 
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
@@ -87,7 +96,7 @@ bool SetFileAccessibility(const std::string& filePath, bool makeAccessible) {
 
         ZeroMemory(&ea, sizeof(EXPLICIT_ACCESS));
         ea.grfAccessPermissions = GENERIC_ALL;
-        ea.grfAccessMode = makeAccessible ? SET_ACCESS : DENY_ACCESS;
+        ea.grfAccessMode = makeAccessible ? SET_ACCESS : DENY_ACCESS; // SET_ACCESS removes existing DENY_ACCESS automatically if overwriting
         ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
         ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
         ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
@@ -118,8 +127,6 @@ bool UploadBatch(const Json::Value& batch) {
         writer["indentation"] = "";
         std::string jsonStr = Json::writeString(writer, batch);
 
-        LogMessage("Uploading batch of " + std::to_string(batch.size()) + " items...");
-
         std::string url = SUPABASE_URL + "/rest/v1/file_permissions";
         struct curl_slist* headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -146,7 +153,6 @@ bool UploadBatch(const Json::Value& batch) {
         if (res == CURLE_OK && (http_code >= 200 && http_code < 300)) {
             return true;
         } else {
-            LogMessage("Upload failed: HTTP " + std::to_string(http_code));
             return false;
         }
     } catch (...) {
@@ -160,7 +166,6 @@ bool IsReparsePoint(const std::string& path) {
     return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 }
 
-// Check for blocked system folders
 bool IsBlocked(const std::string& name) {
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
@@ -174,58 +179,41 @@ bool IsBlocked(const std::string& name) {
 
 // Recursively scan a single scope root and sync to Supabase
 void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths) {
-    if (!fs::exists(rootPath)) {
-        LogMessage("Scope root not found: " + rootPath);
-        return;
-    }
+    if (!fs::exists(rootPath)) return;
 
-    LogMessage("Syncing Scope: " + rootPath);
     Json::Value batch(Json::arrayValue);
-    int batchCount = 0;
-    int scannedCount = 0;
 
     try {
         for (const auto& entry : fs::recursive_directory_iterator(rootPath, fs::directory_options::skip_permission_denied)) {
             try {
-                scannedCount++;
                 std::string fullPath = entry.path().string();
                 std::string fileName = entry.path().filename().string();
                 
-                if (scannedCount <= 5) LogMessage("Scanning: " + fullPath);
-
-                if (IsBlocked(fileName)) {
-                    // LogMessage("Skipping blocked: " + fileName);
-                    continue;
-                }
-                if (entry.is_symlink() || IsReparsePoint(fullPath)) {
-                    // LogMessage("Skipping symlink: " + fileName);
-                    continue;
-                }
+                if (IsBlocked(fileName)) continue;
+                if (entry.is_symlink() || IsReparsePoint(fullPath)) continue;
 
                 DWORD attrs = GetFileAttributesA(fullPath.c_str());
                 if (attrs != INVALID_FILE_ATTRIBUTES && ((attrs & FILE_ATTRIBUTE_HIDDEN) || (attrs & FILE_ATTRIBUTE_SYSTEM))) {
                     continue;
                 }
 
-                // Add to current paths set (for deletion detection later)
                 std::string normPath = fullPath;
                 std::replace(normPath.begin(), normPath.end(), '\\', '/');
                 currentPaths.insert(normPath);
 
-                // Check cache to avoid re-uploading unchanged files
                 std::string modTime;
                 try {
                     auto ftime = fs::last_write_time(entry.path());
                     modTime = GetISOTimestamp(ftime);
                 } catch(...) { modTime = "UNKNOWN"; }
 
-                if (g_fileCache.count(normPath) && g_fileCache[normPath] == modTime) {
-                    continue; // Unchanged
+                {
+                    std::lock_guard<std::mutex> lock(g_cacheMutex);
+                    if (g_fileCache.count(normPath) && g_fileCache[normPath] == modTime) {
+                        continue; // Unchanged
+                    }
                 }
 
-                if (scannedCount <= 5) LogMessage("Preparing upload for: " + fileName);
-
-                // Prepare JSON item
                 Json::Value item;
                 std::string parentPath = entry.path().parent_path().string();
                 std::replace(parentPath.begin(), parentPath.end(), '\\', '/');
@@ -239,7 +227,7 @@ void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths)
 
                 if (entry.is_directory()) {
                      item["file_size"] = "0";
-                     item["file_extension"] = ""; // Ensure field exists
+                     item["file_extension"] = ""; 
                 } else {
                      try { item["file_size"] = std::to_string(fs::file_size(entry.path())); } 
                      catch(...) { item["file_size"] = "0"; }
@@ -247,34 +235,27 @@ void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths)
                 }
 
                 batch.append(item);
-                g_fileCache[normPath] = modTime; // Update cache
+                
+                {
+                    std::lock_guard<std::mutex> lock(g_cacheMutex);
+                    g_fileCache[normPath] = modTime;
+                }
 
-                // Upload if batch full
                 if (batch.size() >= 50) {
-                    LogMessage("Uploading batch of 50 items...");
                     UploadBatch(batch);
                     batch.clear();
                 }
 
-            } catch (const std::exception& e) {
-                LogMessage("Skip problematic file: " + std::string(e.what()));
-            }
+            } catch (...) {}
         }
         
-        LogMessage("Scan complete for " + rootPath + ". Total scanned: " + std::to_string(scannedCount));
-
-        // Upload remaining
         if (!batch.empty()) {
-            LogMessage("Uploading remaining batch of " + std::to_string(batch.size()));
             UploadBatch(batch);
         }
 
-    } catch (const std::exception& e) {
-        LogMessage("Error scanning scope " + rootPath + ": " + e.what());
-    }
+    } catch (...) {}
 }
 
-// Fetch configured scopes from DB
 struct Scope {
     std::string folder_name;
     std::string root_path;
@@ -282,10 +263,8 @@ struct Scope {
 
 std::vector<Scope> FetchScopes() {
     std::vector<Scope> scopes;
-    // Fallback/Default scopes
     scopes.push_back({"Documents", "C:/Users/Adi/Documents"});
     scopes.push_back({"Downloads", "C:/Users/Adi/Downloads"});
-    // TODO: Implement actual DB fetch if needed, but hardcoded is safer for first pass
     return scopes;
 }
 
@@ -293,8 +272,8 @@ void DeleteFileFromDB(const std::string& path) {
     try {
         CURL* curl = curl_easy_init();
         if (!curl) return;
-        std::string encodedPath = path; // Simple handle, assume path is safe or use curl_easy_escape if complex
-        // Ideally use curl_easy_escape
+        
+        std::string encodedPath = path;
         char* output = curl_easy_escape(curl, path.c_str(), path.length());
         if(output) {
             encodedPath = std::string(output);
@@ -313,7 +292,6 @@ void DeleteFileFromDB(const std::string& path) {
         curl_easy_perform(curl);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
-        LogMessage("Deleted from DB: " + path);
     } catch (...) {}
 }
 
@@ -339,62 +317,10 @@ void UpdateHeartbeat() {
     } catch (...) {}
 }
 
-// FETCH AND ENFORCE LOCKS from Supabase
-void ApplyPermissions() {
-    try {
-        CURL* curl = curl_easy_init();
-        if (!curl) return;
-
-        std::string response;
-        // Fetch all permissions to ensure we sync locks
-        std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path,accessible";
-        struct curl_slist* headers = NULL;
-        headers = curl_slist_append(headers, ("apikey: " + SUPABASE_KEY).c_str());
-        headers = curl_slist_append(headers, ("Authorization: Bearer " + SUPABASE_KEY).c_str());
-
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-
-        if (curl_easy_perform(curl) == CURLE_OK) {
-            Json::Value root;
-            Json::CharReaderBuilder builder;
-            std::istringstream stream(response);
-            std::string errs;
-            if (Json::parseFromStream(builder, stream, &root, &errs)) {
-                for (const auto& item : root) {
-                    std::string path = item["file_path"].asString();
-                    if (!item["accessible"].isNull()) {
-                        bool accessible = item["accessible"].asBool();
-                        
-                        // CRITICAL: Convert forward slashes back to backslashes for Windows API
-                        std::replace(path.begin(), path.end(), '/', '\\');
-                        
-                        if (fs::exists(path)) {
-                            SetFileAccessibility(path, accessible);
-                        }
-                    }
-                }
-            }
-        }
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
-    } catch (...) { 
-        LogMessage("Error applying permissions."); 
-    }
-}
-
-int main() {
-    LogMessage("Starting GateKeeper Service v3.1 (Multi-Scope + Locking)");
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    
-    // Initial cleanup of old state
-    // We rely on the initial full scan to populate g_fileCache
-    // Any file in DB but not in scopes will be deleted eventually
-    
-    while (true) {
+// === THREAD 1: SCANNER LOOP (Low Frequency) ===
+void ScannerLoop() {
+    LogMessage("Scanner Thread Started (Frequency: 5s)");
+    while (g_running) {
         try {
             std::vector<Scope> scopes = FetchScopes();
             std::set<std::string> allCurrentPaths;
@@ -403,32 +329,104 @@ int main() {
                 SyncScope(scope.root_path, allCurrentPaths);
             }
 
-            // Garbage Collection: Delete files in Cache that were NOT seen in this cycle
-            // This handles files deleted from disk
+            // Garbage Collection
             std::vector<std::string> toDelete;
-            for (auto it = g_fileCache.begin(); it != g_fileCache.end(); ) {
-                if (allCurrentPaths.find(it->first) == allCurrentPaths.end()) {
-                    // File is in cache but was not seen in any scope -> Deleted
-                    LogMessage("File deleted from disk: " + it->first);
-                    DeleteFileFromDB(it->first);
-                    toDelete.push_back(it->first);
-                    it = g_fileCache.erase(it);
-                } else {
-                    ++it;
+            {
+                std::lock_guard<std::mutex> lock(g_cacheMutex);
+                for (auto it = g_fileCache.begin(); it != g_fileCache.end(); ) {
+                    if (allCurrentPaths.find(it->first) == allCurrentPaths.end()) {
+                        toDelete.push_back(it->first);
+                        it = g_fileCache.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
             }
 
-            // PHASE 3: FETCH AND ENFORCE LOCKS
-            ApplyPermissions();
+            for(const auto& path : toDelete) {
+                 DeleteFileFromDB(path);
+            }
+
+            // Sleep 5 seconds
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        } catch (...) {}
+    }
+}
+
+// === THREAD 2: ENFORCER LOOP (High Frequency) ===
+void EnforcerLoop() {
+    LogMessage("Enforcer Thread Started (Frequency: 500ms)");
+    while (g_running) {
+        try {
+            CURL* curl = curl_easy_init();
+            if (curl) {
+                std::string response;
+                std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path,accessible";
+                struct curl_slist* headers = NULL;
+                headers = curl_slist_append(headers, ("apikey: " + SUPABASE_KEY).c_str());
+                headers = curl_slist_append(headers, ("Authorization: Bearer " + SUPABASE_KEY).c_str());
+
+                curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L); // Fast timeout
+
+                if (curl_easy_perform(curl) == CURLE_OK) {
+                    Json::Value root;
+                    Json::CharReaderBuilder builder;
+                    std::istringstream stream(response);
+                    std::string errs;
+                    if (Json::parseFromStream(builder, stream, &root, &errs)) {
+                        for (const auto& item : root) {
+                            std::string path = item["file_path"].asString();
+                            if (!item["accessible"].isNull()) {
+                                bool accessible = item["accessible"].asBool();
+                                std::replace(path.begin(), path.end(), '/', '\\');
+                                
+                                // CACHING: Only apply if state changed or new
+                                bool stateChanged = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(g_lockMutex);
+                                    if (g_lockCache.find(path) == g_lockCache.end() || g_lockCache[path] != accessible) {
+                                        stateChanged = true;
+                                        g_lockCache[path] = accessible;
+                                    }
+                                }
+
+                                if (stateChanged && fs::exists(path)) {
+                                    // LogMessage("Enforcing Lock State change for: " + path);
+                                    SetFileAccessibility(path, accessible);
+                                }
+                            }
+                        }
+                    }
+                }
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+            }
 
             UpdateHeartbeat();
-            Sleep(2000); // 2 second pause between cycles
+            
+            // Sleep 500 ms (Fast Response)
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        } catch (const std::exception& e) {
-            LogMessage("Main Loop Error: " + std::string(e.what()));
-            Sleep(5000);
-        }
+        } catch (...) {}
     }
+}
+
+int main() {
+    LogMessage("Starting GateKeeper Service v3.2 (Multi-Threaded)");
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    
+    // Launch threads
+    std::thread scanner(ScannerLoop);
+    std::thread enforcer(EnforcerLoop);
+
+    // Keep main thread alive
+    scanner.join();
+    enforcer.join();
 
     curl_global_cleanup();
     return 0;
