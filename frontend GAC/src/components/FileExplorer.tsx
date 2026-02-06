@@ -35,12 +35,19 @@ interface FolderState {
   };
 }
 
-export default function FileExplorer() {
+interface FileExplorerProps {
+  rootPath: string; // "C:/Users/Adi/Documents"
+}
+
+export default function FileExplorer({ rootPath }: FileExplorerProps) {
   const [lastSynced, setLastSynced] = useState<Date>(new Date());
   const { theme } = useTheme();
   const [rootItems, setRootItems] = useState<FileItem[]>([]);
   const [folderStates, setFolderStates] = useState<FolderState>({});
-  const [currentPath, setCurrentPath] = useState<string[]>(['Documents']);
+  // Initialize currentPath based on the rootPath name
+  const rootName = rootPath.split('/').pop() || 'Root';
+  const [currentPath, setCurrentPath] = useState<string[]>([rootName]);
+
   const [searchTerm, setSearchTerm] = useState('');
   const [searchResults, setSearchResults] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -62,7 +69,7 @@ export default function FileExplorer() {
     checkServiceStatus();
     const cleanup = subscribeToChanges();
     return cleanup;
-  }, []);
+  }, [rootPath]); // Re-run when scope changes
 
   // Check service status
   const checkServiceStatus = async () => {
@@ -87,9 +94,12 @@ export default function FileExplorer() {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'file_permissions' },
         (payload) => {
-          console.log('Change detected:', payload);
-          // Refresh current view
-          loadRootItems();
+          // Optimization: Check if the changed file belongs to our scope
+          const newFile = payload.new as FileItem;
+          // If available, check if path starts with rootPath
+          // But payload.new might be incomplete or normalized differently
+          // Safest is to just refresh for now
+          loadRootItems(true); // Silent refresh
         }
       )
       .on(
@@ -110,7 +120,16 @@ export default function FileExplorer() {
   const loadRootItems = async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const { data, error } = await supabase.rpc('get_root_items');
+      // Instead of generic get_root_items via RPC which might be hardcoded to Documents
+      // We do a direct select for flexibility, OR update the RPC. 
+      // Direct select is safer for this dynamic scope feature without modifying SQL functions constantly.
+
+      const { data, error } = await supabase
+        .from('file_permissions')
+        .select('*')
+        .eq('parent_path', rootPath) // Key change: Filter by rootPath
+        .order('is_directory', { ascending: false })
+        .order('name');
 
       if (error) {
         console.error('Error loading root items:', error);
@@ -137,9 +156,13 @@ export default function FileExplorer() {
     }
 
     try {
-      const { data, error } = await supabase.rpc('get_folder_contents', {
-        folder_path: folderPath
-      });
+      // Direct Select
+      const { data, error } = await supabase
+        .from('file_permissions')
+        .select('*')
+        .eq('parent_path', folderPath)
+        .order('is_directory', { ascending: false })
+        .order('name');
 
       if (error) {
         console.error('Error loading folder:', error);
@@ -184,9 +207,9 @@ export default function FileExplorer() {
       setLastSynced(new Date());
     };
 
-    const intervalId = setInterval(poll, 2000);
+    const intervalId = setInterval(poll, 3000); // Relaxed polling
     return () => clearInterval(intervalId);
-  }, []); // Run once on mount
+  }, [rootPath]); // Reset poll on scope change
 
   // Toggle folder open/closed
   const toggleFolder = async (item: FileItem) => {
@@ -204,7 +227,7 @@ export default function FileExplorer() {
     }
   };
 
-  // Toggle file/folder accessibility - FIXED VERSION
+  // Toggle file/folder accessibility
   const toggleAccessibility = async (item: FileItem, e: React.MouseEvent) => {
     e.stopPropagation();
 
@@ -219,19 +242,23 @@ export default function FileExplorer() {
 
       if (error) {
         console.error('Error updating accessibility:', error);
-        alert('Failed to update. Please run fix_rpc.sql in Supabase.');
+        // Fallback to direct update if RPC fails
+        const { error: directError } = await supabase
+          .from('file_permissions')
+          .update({ accessible: newStatus })
+          .eq('id', item.id);
+
+        if (directError) alert('Failed to update status.');
       } else {
-        // Success - let realtime subscription handle the UI update
-        // Or manually refresh the view
-        await loadRootItems();
+        await loadRootItems(true);
       }
     } catch (error) {
       console.error('Exception updating accessibility:', error);
-      alert('An error occurred. Please try again.');
     }
   };
 
-  // Search files
+  // Search files - scoped to current root implicitly via UI context usually, 
+  // but global search is arguably better. We'll stick to global for now or refine later.
   const handleSearch = async () => {
     if (!searchTerm.trim()) {
       setSearchResults([]);
@@ -354,7 +381,7 @@ export default function FileExplorer() {
       {/* Header */}
       <div className="mb-6">
         <div className="flex items-center justify-between mb-4">
-          <h1 className="text-2xl font-bold">GateKeeper File Explorer</h1>
+          <h1 className="text-2xl font-bold">GateKeeper Explorer</h1>
           <div className="flex items-center gap-4">
             <div className="text-xs text-gray-500">
               Last synced: {lastSynced.toLocaleTimeString()}
@@ -367,7 +394,7 @@ export default function FileExplorer() {
             </button>
             <div className={`w-3 h-3 rounded-full ${serviceOnline ? 'bg-green-500' : 'bg-red-500'}`} />
             <span className={`text-sm ${theme === 'stealth' ? 'text-gray-400' : 'text-gray-600'}`}>
-              {serviceOnline ? 'Service Online' : 'Service Offline'}
+              {serviceOnline ? 'System Online' : 'System Offline'}
             </span>
           </div>
         </div>
@@ -376,7 +403,7 @@ export default function FileExplorer() {
         <div className="flex gap-2">
           <input
             type="text"
-            placeholder="Search files..."
+            placeholder="Search all scopes..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             onKeyPress={(e) => e.key === 'Enter' && handleSearch()}
@@ -408,7 +435,7 @@ export default function FileExplorer() {
 
       {/* File Tree */}
       <div className={`border rounded-lg p-4 ${containerClass}`}>
-        {/* Breadcrumb */}
+        {/* Breadcrumb - Static for Root for now */}
         <div
           className={`flex items-center gap-2 mb-4 pb-3 border-b ${theme === 'stealth' ? 'border-gray-700' : 'border-gray-100'
             }`}
@@ -427,7 +454,8 @@ export default function FileExplorer() {
           <div className="text-center py-8 text-gray-500">Loading files...</div>
         ) : rootItems.length === 0 ? (
           <div className="text-center py-8 text-gray-500">
-            No files found. Make sure the C++ service is running.
+            No files found in {rootName}.
+            <br /><span className="text-xs opacity-70">Make sure the C++ service has scanned this scope.</span>
           </div>
         ) : (
           <div className="space-y-1">
@@ -436,21 +464,11 @@ export default function FileExplorer() {
         )}
       </div>
 
-      {/* Info Box */}
-      <div
-        className={`mt-6 p-4 rounded-lg border text-sm ${theme === 'stealth'
-          ? 'bg-blue-900/20 border-blue-800/50 text-blue-200'
-          : 'bg-blue-50 border-blue-200 text-gray-700'
-          }`}
-      >
-        <p className="font-semibold mb-2">How it works:</p>
-        <ul className="list-disc list-inside space-y-1 opacity-80">
-          <li>Click folders to expand/collapse their contents</li>
-          <li>Click lock icons to toggle file accessibility</li>
-          <li>Changes sync automatically via Supabase Realtime</li>
-          <li>The C++ service applies actual Windows permissions</li>
-        </ul>
+      {/* Scope Info */}
+      <div className="mt-4 text-xs opacity-40 font-mono text-center">
+        ScopeID: {rootPath}
       </div>
+
     </div>
   );
 }

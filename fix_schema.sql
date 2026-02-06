@@ -1,32 +1,33 @@
--- ===================================================
--- GATEKEEPER - SCHEMA REPAIR
--- Run this if your frontend is connected but shows no files.
--- This ensures the table structure matches what the C++ agent expects.
--- ===================================================
+-- Run this script to fix the columns and constraints
+-- It avoids creating policies that already exist
 
--- 1. Create/Update the table
-CREATE TABLE IF NOT EXISTS file_permissions (
-    id BIGSERIAL PRIMARY KEY,
-    file_path TEXT UNIQUE,
-    name TEXT,
-    is_directory BOOLEAN,
-    accessible BOOLEAN DEFAULT true,
-    parent_path TEXT,
-    file_size TEXT,
-    file_extension TEXT,
-    last_modified TIMESTAMP WITH TIME ZONE
+-- 1. Ensure columns exist
+ALTER TABLE file_permissions ADD COLUMN IF NOT EXISTS file_size TEXT DEFAULT '0';
+ALTER TABLE file_permissions ADD COLUMN IF NOT EXISTS file_extension TEXT DEFAULT '';
+ALTER TABLE file_permissions ADD COLUMN IF NOT EXISTS last_modified TEXT DEFAULT '';
+
+-- 2. Relax constraints (nullable) to prevent 400 errors
+ALTER TABLE file_permissions ALTER COLUMN file_size DROP NOT NULL;
+ALTER TABLE file_permissions ALTER COLUMN file_extension DROP NOT NULL;
+ALTER TABLE file_permissions ALTER COLUMN last_modified DROP NOT NULL;
+
+-- 3. Fix Unique Constraint for Upsert
+ALTER TABLE file_permissions DROP CONSTRAINT IF EXISTS unique_file_path;
+ALTER TABLE file_permissions ADD CONSTRAINT unique_file_path UNIQUE (file_path);
+
+-- 4. Verify scopes table exists (idempotent)
+CREATE TABLE IF NOT EXISTS monitored_scopes (
+  id BIGSERIAL PRIMARY KEY,
+  folder_name TEXT NOT NULL,
+  root_path TEXT UNIQUE NOT NULL
 );
 
--- 2. Enable Realtime (Critical for the UI to update instantly)
--- First, check if the publication exists, if not create it, else just add the table.
--- Simpler approach that works in most Supabase setups:
--- alter publication supabase_realtime add table file_permissions;
--- NOTE: If the above line fails with "already member", it's fine. Proceed.
+-- 5. Insert default scopes if missing
+INSERT INTO monitored_scopes (folder_name, root_path) 
+VALUES 
+  ('Documents', 'C:/Users/Adi/Documents'),
+  ('Downloads', 'C:/Users/Adi/Downloads')
+ON CONFLICT (root_path) DO NOTHING;
 
--- 3. Ensure permissions are OPEN for the frontend (as previously fixed)
-DROP POLICY IF EXISTS "Allow all known users to read" ON file_permissions;
-DROP POLICY IF EXISTS "Allow all access to file permissions" ON file_permissions;
-
-CREATE POLICY "Allow all access to file permissions" 
-ON file_permissions FOR ALL 
-USING (TRUE) WITH CHECK (TRUE);
+-- 6. Important for Realtime updates on non-PK columns
+ALTER TABLE file_permissions REPLICA IDENTITY FULL;
