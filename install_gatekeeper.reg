@@ -1,0 +1,15 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\GatekeeperLock]
+@="🔒 Gatekeeper Lock"
+"Icon"="imageres.dll,24"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\GatekeeperLock\command]
+@="\"C:\\Users\\Adi\\AppData\\Local\\Programs\\Python\\Python314\\python.exe\" \"C:\\Users\\Adi\\Desktop\\G.A.C PROJECT\\lock_tool.py\" \"%1\""
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\GatekeeperLock]
+@="🔒 Gatekeeper Lock"
+"Icon"="imageres.dll,24"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\GatekeeperLock\command]
+@="\"C:\\Users\\Adi\\AppData\\Local\\Programs\\Python\\Python314\\python.exe\" \"C:\\Users\\Adi\\Desktop\\G.A.C PROJECT\\lock_tool.py\" \"%V\""

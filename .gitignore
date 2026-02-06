@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv
+.vscode
+.idea
+*.log
+
+.env
+node_modules/
+vcpkg/
+vcpkg_installed/
+
+# C++ Build Artifacts
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.tlog
+*.idb
+*.ipch
+
+# Visual Studio
+.vs/
+*.slnx
+*.suo
+*.user
+*.opensdf
+*.sdf
+
+# Frontend
+frontend GAC/dist/
+frontend GAC/coverage/
