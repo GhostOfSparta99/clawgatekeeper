@@ -29,8 +29,8 @@ function App() {
           <button
             onClick={() => setCurrentScope(SCOPES.DOCUMENTS)}
             className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-all text-sm font-medium ${currentScope === SCOPES.DOCUMENTS
-                ? 'bg-blue-600/20 text-blue-500 border border-blue-600/50'
-                : 'hover:bg-black/5 dark:hover:bg-white/5 opacity-60 hover:opacity-100'
+              ? 'bg-blue-600/20 text-blue-500 border border-blue-600/50'
+              : 'hover:bg-black/5 dark:hover:bg-white/5 opacity-60 hover:opacity-100'
               }`}
           >
             <span className="text-lg">📄</span> Documents
@@ -39,8 +39,8 @@ function App() {
           <button
             onClick={() => setCurrentScope(SCOPES.DOWNLOADS)}
             className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-all text-sm font-medium ${currentScope === SCOPES.DOWNLOADS
-                ? 'bg-blue-600/20 text-blue-500 border border-blue-600/50'
-                : 'hover:bg-black/5 dark:hover:bg-white/5 opacity-60 hover:opacity-100'
+              ? 'bg-blue-600/20 text-blue-500 border border-blue-600/50'
+              : 'hover:bg-black/5 dark:hover:bg-white/5 opacity-60 hover:opacity-100'
               }`}
           >
             <span className="text-lg">📥</span> Downloads
