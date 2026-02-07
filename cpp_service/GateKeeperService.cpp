@@ -78,18 +78,59 @@ std::string GetISOTimestamp(const fs::file_time_type& ftime) {
     }
 }
 
+#include <sddl.h>
+
+// ... (includes remain) ...
+
+// NEW: Force Unlock by overwriting DACL if standard access fails
+bool ForceUnlock(const std::wstring& wPath) {
+    // SDDL: D:(A;;FA;;;WD) -> DACL: Allow FileAll to World (Everyone)
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;FA;;;WD)", 
+            SDDL_REVISION_1, 
+            &pSD, 
+            NULL)) {
+        
+        BOOL present = FALSE;
+        BOOL defaulted = FALSE;
+        PACL pDacl = NULL;
+        GetSecurityDescriptorDacl(pSD, &present, &pDacl, &defaulted);
+        
+        DWORD res = SetNamedSecurityInfoW(
+            (LPWSTR)wPath.c_str(), 
+            SE_FILE_OBJECT, 
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, 
+            NULL, NULL, pDacl, NULL);
+            
+        LocalFree(pSD);
+        return (res == ERROR_SUCCESS);
+    }
+    return false;
+}
+
 bool SetFileAccessibility(const std::string& filePath, bool makeAccessible) {
     try {
         int size_needed = MultiByteToWideChar(CP_UTF8, 0, filePath.c_str(), -1, NULL, 0);
         std::wstring wPath(size_needed, 0);
         MultiByteToWideChar(CP_UTF8, 0, filePath.c_str(), -1, &wPath[0], size_needed);
 
+        // OPTIMIZATION: If Unlocking, try ForceUnlock directly if we suspect issues
+        // But let's try standard way first.
+
         PACL pOldDACL = NULL, pNewDACL = NULL;
         PSECURITY_DESCRIPTOR pSD = NULL;
         EXPLICIT_ACCESS ea;
 
         DWORD res = GetNamedSecurityInfoW(wPath.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &pOldDACL, NULL, &pSD);
-        if (res != ERROR_SUCCESS) return false;
+        if (res != ERROR_SUCCESS) {
+            // NEW: If we can't read the DACL (Access Denied) and we want to UNLOCK, force it.
+            if (makeAccessible) {
+                LogMessage("WARNING: Standard Unlock failed (Access Denied). Attempting Force Unlock for: " + filePath);
+                return ForceUnlock(wPath);
+            }
+            return false;
+        }
 
         SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
         PSID pEveryoneSID = NULL;
@@ -108,12 +149,18 @@ bool SetFileAccessibility(const std::string& filePath, bool makeAccessible) {
 
         res = SetEntriesInAcl(1, &ea, pOldDACL, &pNewDACL);
         if (res == ERROR_SUCCESS) {
-            SetNamedSecurityInfoW((LPWSTR)wPath.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, pNewDACL, NULL);
+            res = SetNamedSecurityInfoW((LPWSTR)wPath.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, pNewDACL, NULL);
         }
 
         if (pSD) LocalFree(pSD);
         if (pNewDACL) LocalFree(pNewDACL);
         if (pEveryoneSID) FreeSid(pEveryoneSID);
+
+        // NEW: Fallback
+        if (res != ERROR_SUCCESS && makeAccessible) {
+             LogMessage("WARNING: SetEntriesInAcl failed. Attempting Force Unlock for: " + filePath);
+             return ForceUnlock(wPath);
+        }
 
         return (res == ERROR_SUCCESS);
     } catch (...) {
@@ -183,31 +230,43 @@ bool IsBlocked(const std::string& name) {
 }
 
 // NEW: Path safety validator to prevent scanning dangerous directories
+// Check if path is safely within the user's profile and NOT a system/hidden/heavy folder
 bool IsSafePath(const std::string& path) {
-    // Blocklist: System-critical directories
-    static const std::vector<std::string> FORBIDDEN = {
-        "C:/Windows",
-        "C:\\Windows",
-        "C:/Program Files",
-        "C:\\Program Files",
-        "C:/Program Files (x86)",
-        "C:\\Program Files (x86)",
-        "AppData/Local",
-        "AppData\\Local",
-        "AppData/Roaming",
-        "AppData\\Roaming",
-        "$Recycle.Bin",
-        "System Volume Information"
+    // 1. Explicitly Blocked System/Critical Paths
+    static const std::vector<std::string> FORBIDDEN_SUBSTRINGS = {
+        "C:/Windows", "C:\\Windows", 
+        "C:/Program Files", "C:\\Program Files",
+        "C:/Program Files (x86)", "C:\\Program Files (x86)",
+        "AppData/Local", "AppData\\Local", 
+        "AppData/Roaming", "AppData\\Roaming", 
+        "$Recycle.Bin", "System Volume Information"
+    };
+
+    // 2. High-volume Development/Build Folders (Noisy & Useless to Sync)
+    static const std::vector<std::string> IGNORED_FOLDERS = {
+        "node_modules", ".git", ".vscode", ".idea", 
+        "dist", "build", "vendor", "target", "bin", "obj",
+        "__pycache__", ".DS_Store", "vcpkg", "ports"
     };
     
-    for (const auto& blocked : FORBIDDEN) {
+    // Check against forbidden system paths
+    for (const auto& blocked : FORBIDDEN_SUBSTRINGS) {
         if (path.find(blocked) != std::string::npos) {
-            LogMessage("SAFETY: Blocked unsafe path - " + path);
+            // LogMessage("SAFETY: Blocked unsafe path - " + path); // Too noisy
+            return false;
+        }
+    }
+
+    // Check against high-volume ignore list (prevent latency spikes)
+    for (const auto& ignored : IGNORED_FOLDERS) {
+        if (path.find("/" + ignored + "/") != std::string::npos || 
+            path.find("\\" + ignored + "\\") != std::string::npos ||
+            path.find("/" + ignored) != std::string::npos ||  // End of path check
+            path.find("\\" + ignored) != std::string::npos) {
             return false;
         }
     }
     
-    // Must be under user profile for safety
     char* userProfile = std::getenv("USERPROFILE");
     if (userProfile) {
         std::string userProfilePath(userProfile);
@@ -216,8 +275,9 @@ bool IsSafePath(const std::string& path) {
         std::string testPath = path;
         std::replace(testPath.begin(), testPath.end(), '\\', '/');
         
+        // Ensure we are inside user profile (unless explicitly allowed elsewhere)
         if (testPath.find(userProfilePath) == std::string::npos) {
-            LogMessage("SAFETY: Path outside user profile - " + path);
+            // LogMessage("SAFETY: Path outside user profile - " + path);
             return false;
         }
     }
@@ -503,10 +563,19 @@ void EnforcerLoop() {
     LogMessage("Enforcer Thread Started (Frequency: 500ms)");
     while (g_running) {
         try {
-            CURL* curl = curl_easy_init();
-            if (curl) {
+            // LogMessage("DEBUG: Enforcer Heartbeat - Active"); 
+            long offset = 0;
+            bool moreData = true;
+            int totalProcessed = 0;
+
+            while (moreData && g_running) {
+                CURL* curl = curl_easy_init();
+                if (!curl) break;
+
                 std::string response;
-                std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path,accessible";
+                // PAGINATION: Fetch in chunks of 5000 (Optimized for speed) 
+                std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path,accessible&limit=5000&offset=" + std::to_string(offset);
+                
                 struct curl_slist* headers = NULL;
                 headers = curl_slist_append(headers, ("apikey: " + SUPABASE_KEY).c_str());
                 headers = curl_slist_append(headers, ("Authorization: Bearer " + SUPABASE_KEY).c_str());
@@ -515,45 +584,76 @@ void EnforcerLoop() {
                 curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // Standard timeout for chunk
 
-                if (curl_easy_perform(curl) == CURLE_OK) {
+                CURLcode res = curl_easy_perform(curl);
+                long http_code = 0;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+                
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+
+                if (res == CURLE_OK && http_code == 200) {
                     Json::Value root;
                     Json::CharReaderBuilder builder;
                     std::istringstream stream(response);
                     std::string errs;
                     if (Json::parseFromStream(builder, stream, &root, &errs)) {
-                        for (const auto& item : root) {
-                            std::string path = item["file_path"].asString();
-                            if (!item["accessible"].isNull()) {
+                        if (root.empty()) {
+                            moreData = false;
+                        } else {
+                            for (const auto& item : root) {
+                                std::string path = item["file_path"].asString();
                                 bool accessible = item["accessible"].asBool();
-                                std::replace(path.begin(), path.end(), '/', '\\');
+
+                                // Fix path for Windows API
+                                std::string winPath = path;
+                                std::replace(winPath.begin(), winPath.end(), '/', '\\');
                                 
-                                // CACHING: Only apply if state changed or new
+                                // OPTIMIZATION: Skip unsafe/junk paths immediately
+                                if (!IsSafePath(winPath)) {
+                                    continue; 
+                                }
+                                
+                                // CACHING: Check if state actually changed
                                 bool stateChanged = false;
                                 {
                                     std::lock_guard<std::mutex> lock(g_lockMutex);
-                                    if (g_lockCache.find(path) == g_lockCache.end() || g_lockCache[path] != accessible) {
+                                    if (g_lockCache.find(winPath) == g_lockCache.end() || g_lockCache[winPath] != accessible) {
                                         stateChanged = true;
-                                        g_lockCache[path] = accessible;
+                                        g_lockCache[winPath] = accessible;
                                     }
                                 }
 
-                                if (stateChanged && fs::exists(path)) {
-                                    SetFileAccessibility(path, accessible);
+                                if (stateChanged) {
+                                    if (fs::exists(winPath)) {
+                                         LogMessage("DEBUG: Applying Lock State " + std::string(accessible ? "UNLOCK" : "LOCK") + " to: " + winPath);
+                                         bool success = SetFileAccessibility(winPath, accessible);
+                                         LogMessage("DEBUG: Lock Result: " + std::string(success ? "SUCCESS" : "FAILED"));
+                                    }
                                 }
                             }
+                            
+                            totalProcessed += root.size();
+                            offset += root.size();
+                            if (root.size() < 1000) moreData = false; // End of list
                         }
+                    } else {
+                        LogMessage("ERROR: Failed to parse JSON response");
+                        moreData = false;
                     }
+                } else {
+                    LogMessage("ERROR: Valid response fetch failed. Code: " + std::to_string(http_code));
+                    moreData = false;
                 }
-                curl_slist_free_all(headers);
-                curl_easy_cleanup(curl);
             }
-
+            
+            // LogMessage("DEBUG: Enforcer Cycle Complete. Processed: " + std::to_string(totalProcessed));
             UpdateHeartbeat();
             
-            // Sleep 500 ms (Fast Response)
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            // OPTIMIZATION: Reduce sleep to 100ms for faster response
+            // If we processed files, don't sleep at all, just loop again immediately? No, let's yield a bit.
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         } catch (...) {
             LogMessage("ERROR: Exception in EnforcerLoop");
