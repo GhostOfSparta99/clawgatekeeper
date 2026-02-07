@@ -26,6 +26,10 @@ const std::string SUPABASE_URL = "https://hyqmdnzkxhkvzynzqwug.supabase.co";
 const std::string SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5cW1kbnpreGhrdnp5bnpxd3VnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAyODM0MjksImV4cCI6MjA4NTg1OTQyOX0.Oo-jJIivU0YHRbloTJlpl_cwQ9CkrMq6tV9YQUu8F5w";
 const std::string LOG_FILE = "C:\\GateKeeper\\debug.log";
 
+// NEW: Scalability limits
+const size_t MAX_FILES_PER_SCOPE = 50000;  // Prevent DB overload
+const uintmax_t MAX_FILE_SIZE = 5ULL * 1024 * 1024 * 1024; // 5GB - skip very large files
+
 // Global cache to track existing files across ALL scopes
 std::map<std::string, std::string> g_fileCache; // Path -> LastModified
 std::mutex g_cacheMutex; // Protects g_fileCache
@@ -96,7 +100,7 @@ bool SetFileAccessibility(const std::string& filePath, bool makeAccessible) {
 
         ZeroMemory(&ea, sizeof(EXPLICIT_ACCESS));
         ea.grfAccessPermissions = GENERIC_ALL;
-        ea.grfAccessMode = makeAccessible ? SET_ACCESS : DENY_ACCESS; // SET_ACCESS removes existing DENY_ACCESS automatically if overwriting
+        ea.grfAccessMode = makeAccessible ? SET_ACCESS : DENY_ACCESS;
         ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
         ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
         ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
@@ -172,20 +176,112 @@ bool IsBlocked(const std::string& name) {
     static const std::set<std::string> BLOCKED = {
         "my music", "my pictures", "my videos", "start menu", 
         "application data", "local settings", "cookies", 
-        "desktop.ini", "thumbs.db", "ntuser.dat", "$recycle.bin", "system volume information"
+        "desktop.ini", "thumbs.db", "ntuser.dat", "$recycle.bin", 
+        "system volume information", "windows", "program files"
     };
     return BLOCKED.count(lower) > 0;
 }
 
+// NEW: Path safety validator to prevent scanning dangerous directories
+bool IsSafePath(const std::string& path) {
+    // Blocklist: System-critical directories
+    static const std::vector<std::string> FORBIDDEN = {
+        "C:/Windows",
+        "C:\\Windows",
+        "C:/Program Files",
+        "C:\\Program Files",
+        "C:/Program Files (x86)",
+        "C:\\Program Files (x86)",
+        "AppData/Local",
+        "AppData\\Local",
+        "AppData/Roaming",
+        "AppData\\Roaming",
+        "$Recycle.Bin",
+        "System Volume Information"
+    };
+    
+    for (const auto& blocked : FORBIDDEN) {
+        if (path.find(blocked) != std::string::npos) {
+            LogMessage("SAFETY: Blocked unsafe path - " + path);
+            return false;
+        }
+    }
+    
+    // Must be under user profile for safety
+    char* userProfile = std::getenv("USERPROFILE");
+    if (userProfile) {
+        std::string userProfilePath(userProfile);
+        std::replace(userProfilePath.begin(), userProfilePath.end(), '\\', '/');
+        
+        std::string testPath = path;
+        std::replace(testPath.begin(), testPath.end(), '\\', '/');
+        
+        if (testPath.find(userProfilePath) == std::string::npos) {
+            LogMessage("SAFETY: Path outside user profile - " + path);
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// NEW: Resolve OneDrive redirects automatically
+std::string ResolveActualPath(const std::string& requestedPath) {
+    // Check if local path exists and is not empty
+    if (fs::exists(requestedPath) && !fs::is_empty(requestedPath)) {
+        return requestedPath;
+    }
+    
+    // Try OneDrive fallback
+    char* userProfile = std::getenv("USERPROFILE");
+    if (!userProfile) return requestedPath;
+    
+    std::string base(userProfile);
+    std::replace(base.begin(), base.end(), '\\', '/');
+    
+    // Extract folder name (e.g., "Documents" from "C:/Users/Name/Documents")
+    size_t lastSlash = requestedPath.find_last_of("/\\");
+    std::string folderName = (lastSlash != std::string::npos) 
+        ? requestedPath.substr(lastSlash + 1) 
+        : requestedPath;
+    
+    std::string oneDrivePath = base + "/OneDrive/" + folderName;
+    
+    if (fs::exists(oneDrivePath)) {
+        LogMessage("INFO: Redirecting " + folderName + " to OneDrive: " + oneDrivePath);
+        return oneDrivePath;
+    }
+    
+    return requestedPath;
+}
+
 // Recursively scan a single scope root and sync to Supabase
 void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths) {
-    if (!fs::exists(rootPath)) return;
+    if (!fs::exists(rootPath)) {
+        LogMessage("SKIP: Path does not exist - " + rootPath);
+        return;
+    }
 
+    // NEW: Safety check
+    if (!IsSafePath(rootPath)) {
+        LogMessage("ERROR: Unsafe scope rejected - " + rootPath);
+        return;
+    }
+
+    LogMessage("Syncing Scope: " + rootPath);
+    
     Json::Value batch(Json::arrayValue);
+    size_t fileCount = 0; // NEW: Track file count
 
     try {
         for (const auto& entry : fs::recursive_directory_iterator(rootPath, fs::directory_options::skip_permission_denied)) {
             try {
+                // NEW: File count limit to prevent DB overload
+                if (++fileCount > MAX_FILES_PER_SCOPE) {
+                    LogMessage("WARNING: Scope " + rootPath + " exceeded " + std::to_string(MAX_FILES_PER_SCOPE) + " files. Truncating.");
+                    break;
+                }
+
                 std::string fullPath = entry.path().string();
                 std::string fileName = entry.path().filename().string();
                 
@@ -229,7 +325,15 @@ void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths)
                      item["file_size"] = "0";
                      item["file_extension"] = ""; 
                 } else {
-                     try { item["file_size"] = std::to_string(fs::file_size(entry.path())); } 
+                     try { 
+                         uintmax_t size = fs::file_size(entry.path());
+                         // NEW: Skip very large files
+                         if (size > MAX_FILE_SIZE) {
+                             LogMessage("SKIP: File too large (" + std::to_string(size) + " bytes) - " + fullPath);
+                             continue;
+                         }
+                         item["file_size"] = std::to_string(size); 
+                     } 
                      catch(...) { item["file_size"] = "0"; }
                      item["file_extension"] = entry.path().extension().string();
                 }
@@ -253,7 +357,11 @@ void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths)
             UploadBatch(batch);
         }
 
-    } catch (...) {}
+        LogMessage("Scope scan completed: " + rootPath + " (" + std::to_string(fileCount) + " files)");
+
+    } catch (...) {
+        LogMessage("ERROR: Exception during scope scan - " + rootPath);
+    }
 }
 
 struct Scope {
@@ -261,11 +369,40 @@ struct Scope {
     std::string root_path;
 };
 
+// ENHANCED: FetchScopes now includes Phase 1 paths with automatic OneDrive fallback
 std::vector<Scope> FetchScopes() {
     std::vector<Scope> scopes;
-    scopes.push_back({"Documents", "C:/Users/Adi/Documents"});
-    scopes.push_back({"Downloads", "C:/Users/Adi/Downloads"});
-    return scopes;
+    
+    // Get the dynamic user profile path
+    char* userProfile = std::getenv("USERPROFILE");
+    std::string base = userProfile ? std::string(userProfile) : "C:/Users/Adi";
+    std::replace(base.begin(), base.end(), '\\', '/');
+
+    // EXISTING PATHS (unchanged)
+    scopes.push_back({"Documents", base + "/Documents"});
+    scopes.push_back({"Downloads", base + "/Downloads"});
+    
+    // ===== PHASE 1 NEW PATHS =====
+    scopes.push_back({"Desktop", base + "/Desktop"});
+    scopes.push_back({"Pictures", base + "/Pictures"});
+    scopes.push_back({"Videos", base + "/Videos"});
+    // ==============================
+    
+    // Validate and resolve all paths
+    std::vector<Scope> validated;
+    for (auto& scope : scopes) {
+        // Try OneDrive fallback if local path is missing/empty
+        scope.root_path = ResolveActualPath(scope.root_path);
+        
+        if (IsSafePath(scope.root_path) && fs::exists(scope.root_path)) {
+            validated.push_back(scope);
+            LogMessage("Scope ACTIVE: " + scope.folder_name + " at " + scope.root_path);
+        } else {
+            LogMessage("Scope SKIPPED: " + scope.folder_name + " (not found or unsafe)");
+        }
+    }
+    
+    return validated;
 }
 
 void DeleteFileFromDB(const std::string& path) {
@@ -323,6 +460,8 @@ void ScannerLoop() {
     while (g_running) {
         try {
             std::vector<Scope> scopes = FetchScopes();
+            LogMessage("INFO: Scanning " + std::to_string(scopes.size()) + " active scopes");
+            
             std::set<std::string> allCurrentPaths;
 
             for (const auto& scope : scopes) {
@@ -343,14 +482,19 @@ void ScannerLoop() {
                 }
             }
 
-            for(const auto& path : toDelete) {
-                 DeleteFileFromDB(path);
+            if (!toDelete.empty()) {
+                LogMessage("Garbage Collection: Removing " + std::to_string(toDelete.size()) + " deleted files from DB");
+                for(const auto& path : toDelete) {
+                     DeleteFileFromDB(path);
+                }
             }
 
             // Sleep 5 seconds
             std::this_thread::sleep_for(std::chrono::seconds(5));
 
-        } catch (...) {}
+        } catch (...) {
+            LogMessage("ERROR: Exception in ScannerLoop");
+        }
     }
 }
 
@@ -371,7 +515,7 @@ void EnforcerLoop() {
                 curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L); // Fast timeout
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
 
                 if (curl_easy_perform(curl) == CURLE_OK) {
                     Json::Value root;
@@ -396,7 +540,6 @@ void EnforcerLoop() {
                                 }
 
                                 if (stateChanged && fs::exists(path)) {
-                                    // LogMessage("Enforcing Lock State change for: " + path);
                                     SetFileAccessibility(path, accessible);
                                 }
                             }
@@ -412,12 +555,17 @@ void EnforcerLoop() {
             // Sleep 500 ms (Fast Response)
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        } catch (...) {}
+        } catch (...) {
+            LogMessage("ERROR: Exception in EnforcerLoop");
+        }
     }
 }
 
 int main() {
-    LogMessage("Starting GateKeeper Service v3.2 (Multi-Threaded)");
+    LogMessage("=== Starting GateKeeper Service v3.3 (Phase 1 Expansion) ===");
+    LogMessage("NEW PATHS ADDED: Desktop, Pictures, Videos");
+    LogMessage("SAFETY FEATURES: Path validation, OneDrive fallback, file limits");
+    
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
     // Launch threads
