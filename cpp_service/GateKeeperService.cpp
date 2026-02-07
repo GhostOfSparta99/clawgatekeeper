@@ -315,6 +315,47 @@ std::string ResolveActualPath(const std::string& requestedPath) {
     return requestedPath;
 }
 
+// Helper to create a JSON record for a single file
+Json::Value CreateFileRecord(const fs::directory_entry& entry) {
+    Json::Value item;
+    try {
+        std::string fullPath = entry.path().string();
+        std::string fileName = entry.path().filename().string();
+        
+        std::string normPath = fullPath;
+        std::replace(normPath.begin(), normPath.end(), '\\', '/');
+
+        std::string parentPath = entry.path().parent_path().string();
+        std::replace(parentPath.begin(), parentPath.end(), '\\', '/');
+
+        std::string modTime;
+        try {
+            auto ftime = fs::last_write_time(entry.path());
+            modTime = GetISOTimestamp(ftime);
+        } catch(...) { modTime = "UNKNOWN"; }
+
+        item["file_path"] = normPath;
+        item["name"] = fileName;
+        item["parent_path"] = parentPath;
+        item["is_directory"] = entry.is_directory();
+        item["accessible"] = true; // Default
+        item["last_modified"] = modTime;
+
+        if (entry.is_directory()) {
+             item["file_size"] = "0";
+             item["file_extension"] = ""; 
+        } else {
+             try { 
+                 uintmax_t size = fs::file_size(entry.path());
+                 item["file_size"] = std::to_string(size); 
+             } 
+             catch(...) { item["file_size"] = "0"; }
+             item["file_extension"] = entry.path().extension().string();
+        }
+    } catch (...) {}
+    return item;
+}
+
 // Recursively scan a single scope root and sync to Supabase
 void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths) {
     if (!fs::exists(rootPath)) {
@@ -357,6 +398,10 @@ void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths)
                 std::replace(normPath.begin(), normPath.end(), '\\', '/');
                 currentPaths.insert(normPath);
 
+                // Optimization: reuse CreateFileRecord logic? 
+                // For now, let's keep the cache check here to avoid redundant logic changes in this Diff.
+                // Actually, let's use the new helper!
+
                 std::string modTime;
                 try {
                     auto ftime = fs::last_write_time(entry.path());
@@ -365,38 +410,22 @@ void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths)
 
                 {
                     std::lock_guard<std::mutex> lock(g_cacheMutex);
-                    if (g_fileCache.count(normPath) && g_fileCache[normPath] == modTime) {
-                        continue; // Unchanged
+                    if (g_fileCache.count(normPath)) { 
+                        if (g_fileCache[normPath] == modTime) {
+                            continue; // Unchanged
+                        }
                     }
                 }
 
-                Json::Value item;
-                std::string parentPath = entry.path().parent_path().string();
-                std::replace(parentPath.begin(), parentPath.end(), '\\', '/');
-
-                item["file_path"] = normPath;
-                item["name"] = fileName;
-                item["parent_path"] = parentPath;
-                item["is_directory"] = entry.is_directory();
-                item["accessible"] = true; // Default
-                item["last_modified"] = modTime;
-
-                if (entry.is_directory()) {
-                     item["file_size"] = "0";
-                     item["file_extension"] = ""; 
-                } else {
-                     try { 
-                         uintmax_t size = fs::file_size(entry.path());
-                         // NEW: Skip very large files
-                         if (size > MAX_FILE_SIZE) {
-                             LogMessage("SKIP: File too large (" + std::to_string(size) + " bytes) - " + fullPath);
-                             continue;
-                         }
-                         item["file_size"] = std::to_string(size); 
-                     } 
-                     catch(...) { item["file_size"] = "0"; }
-                     item["file_extension"] = entry.path().extension().string();
+                // Check size limit before creating record
+                if (!entry.is_directory()) {
+                     try {
+                         if (fs::file_size(entry.path()) > MAX_FILE_SIZE) continue;
+                     } catch(...) {}
                 }
+
+                Json::Value item = CreateFileRecord(entry);
+                if (item.empty()) continue; // Failed to create
 
                 batch.append(item);
                 
@@ -423,6 +452,25 @@ void SyncScope(const std::string& rootPath, std::set<std::string>& currentPaths)
         LogMessage("ERROR: Exception during scope scan - " + rootPath);
     }
 }
+
+// Assuming UploadBatch function exists and has the following structure for the logging to be added:
+// void UploadBatch(const Json::Value& batch) {
+//     CURL* curl = curl_easy_init();
+//     // ... setup curl ...
+//     std::string readBuffer; // Assuming this is used to capture response body
+//     CURLcode res = curl_easy_perform(curl);
+//     // ... cleanup curl ...
+//     if (res != CURLE_OK) {
+//         LogMessage("ERROR: UploadBatch Failed - " + std::string(curl_easy_strerror(res)));
+//     } else {
+//         long response_code;
+//         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+//         if (response_code != 200 && response_code != 201) {
+//              LogMessage("ERROR: UploadBatch HTTP Error " + std::to_string(response_code) + " - " + readBuffer);
+//         }
+//         // LogMessage("DEBUG: Batch Uploaded (" + std::to_string(batch.size()) + " items)");
+//     }
+// }
 
 struct Scope {
     std::string folder_name;
@@ -493,6 +541,15 @@ void DeleteFileFromDB(const std::string& path) {
 }
 
 void UpdateHeartbeat() {
+    static std::chrono::steady_clock::time_point lastHeartbeat = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    
+    // THROTTLE: Only update every 10 seconds
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - lastHeartbeat).count() < 10) {
+        return; 
+    }
+    lastHeartbeat = now;
+
     try {
         CURL* curl = curl_easy_init();
         if (!curl) return;
@@ -502,25 +559,113 @@ void UpdateHeartbeat() {
         headers = curl_slist_append(headers, ("apikey: " + SUPABASE_KEY).c_str());
         headers = curl_slist_append(headers, ("Authorization: Bearer " + SUPABASE_KEY).c_str());
         
-        std::string json = "{\"service_online\": true}";
+        std::string json = "{\"service_online\": true, \"last_seen\": \"now()\"}";
         
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json.c_str());
-        curl_easy_perform(curl);
+        
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+             LogMessage("ERROR: Heartbeat Failed - " + std::string(curl_easy_strerror(res)));
+        }
+
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
     } catch (...) {}
 }
 
-// === THREAD 1: SCANNER LOOP (Low Frequency) ===
+// === REAL-TIME WATCHER LOGIC ===
+
+void HandleFileChange(const std::string& fullPath, DWORD action) {
+    try {
+        std::string normPath = fullPath;
+        std::replace(normPath.begin(), normPath.end(), '\\', '/');
+
+        if (!IsSafePath(normPath)) return;
+        
+        std::string fileName = fs::path(normPath).filename().string();
+        if (IsBlocked(fileName)) return;
+
+        // Debounce: If we just processed this file in the last 500ms, skip
+        // (Simplified for now: Just proceed, Supabase handles merge)
+
+        if (action == FILE_ACTION_ADDED || action == FILE_ACTION_MODIFIED || action == FILE_ACTION_RENAMED_NEW_NAME) {
+            if (fs::exists(fullPath)) {
+                // Wait briefly for file lock to release if it's being written
+                std::this_thread::sleep_for(std::chrono::milliseconds(50)); 
+                
+                try {
+                    fs::directory_entry entry(fullPath);
+                    Json::Value item = CreateFileRecord(entry);
+                    if (!item.empty()) {
+                        Json::Value batch(Json::arrayValue);
+                        batch.append(item);
+                        UploadBatch(batch);
+                        LogMessage("WATCHER: Synced " + fileName);
+                    }
+                } catch(...) {}
+            }
+        } else if (action == FILE_ACTION_REMOVED || action == FILE_ACTION_RENAMED_OLD_NAME) {
+            DeleteFileFromDB(normPath);
+            LogMessage("WATCHER: Removed " + fileName);
+        }
+    } catch (...) {}
+}
+
+void WatchDirectory(std::string path) {
+    LogMessage("WATCHER START: " + path);
+    
+    HANDLE hDir = CreateFileA(path.c_str(), FILE_LIST_DIRECTORY, 
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 
+        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    
+    if (hDir == INVALID_HANDLE_VALUE) {
+        LogMessage("WATCHER ERROR: Invalid Handle for " + path);
+        return;
+    }
+
+    char buffer[1024 * 64]; // 64KB Buffer
+    DWORD bytesReturned;
+    
+    while (g_running) {
+        if (ReadDirectoryChangesW(hDir, buffer, sizeof(buffer), TRUE, 
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
+            &bytesReturned, NULL, NULL)) {
+            
+            FILE_NOTIFY_INFORMATION* pNotify = (FILE_NOTIFY_INFORMATION*)buffer;
+            do {
+                std::wstring wFileName(pNotify->FileName, pNotify->FileNameLength / sizeof(WCHAR));
+                
+                // Convert WCHAR to std::string (UTF-8)
+                int size_needed = WideCharToMultiByte(CP_UTF8, 0, wFileName.c_str(), (int)wFileName.length(), NULL, 0, NULL, NULL);
+                std::string fileName(size_needed, 0);
+                WideCharToMultiByte(CP_UTF8, 0, wFileName.c_str(), (int)wFileName.length(), &fileName[0], size_needed, NULL, NULL);
+
+                std::string fullPath = path + "/" + fileName;
+                
+                HandleFileChange(fullPath, pNotify->Action);
+
+                if (pNotify->NextEntryOffset == 0) break;
+                pNotify = (FILE_NOTIFY_INFORMATION*)((char*)pNotify + pNotify->NextEntryOffset);
+            } while (true);
+        } else {
+            // Wait a bit before retrying if error (or just exit loop if handle died)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+    CloseHandle(hDir);
+    LogMessage("WATCHER STOP: " + path);
+}
+
+// === THREAD 1: SCANNER LOOP (Low Frequency Consistency Check) ===
 void ScannerLoop() {
-    LogMessage("Scanner Thread Started (Frequency: 5s)");
+    LogMessage("Scanner Thread Started (Frequency: 5 minutes - Fallback Mode)");
     while (g_running) {
         try {
             std::vector<Scope> scopes = FetchScopes();
-            LogMessage("INFO: Scanning " + std::to_string(scopes.size()) + " active scopes");
+            // LogMessage("INFO: Consistency Scan Started...");
             
             std::set<std::string> allCurrentPaths;
 
@@ -549,8 +694,8 @@ void ScannerLoop() {
                 }
             }
 
-            // Sleep 5 seconds
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            // Sleep 5 minutes (Real-time checks handled by Watchers)
+            for(int i=0; i<300 && g_running; i++) std::this_thread::sleep_for(std::chrono::seconds(1));
 
         } catch (...) {
             LogMessage("ERROR: Exception in ScannerLoop");
@@ -560,7 +705,7 @@ void ScannerLoop() {
 
 // === THREAD 2: ENFORCER LOOP (High Frequency) ===
 void EnforcerLoop() {
-    LogMessage("Enforcer Thread Started (Frequency: 500ms)");
+    LogMessage("Enforcer Thread Started (Frequency: 100ms)");
     while (g_running) {
         try {
             // LogMessage("DEBUG: Enforcer Heartbeat - Active"); 
@@ -573,8 +718,8 @@ void EnforcerLoop() {
                 if (!curl) break;
 
                 std::string response;
-                // PAGINATION: Fetch in chunks of 5000 (Optimized for speed) 
-                std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path,accessible&limit=5000&offset=" + std::to_string(offset);
+                // PAGINATION FIX: Limit 1000 (Supabase default max) + Stable Sort
+                std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path,accessible&limit=1000&order=file_path.asc&offset=" + std::to_string(offset);
                 
                 struct curl_slist* headers = NULL;
                 headers = curl_slist_append(headers, ("apikey: " + SUPABASE_KEY).c_str());
@@ -602,9 +747,14 @@ void EnforcerLoop() {
                         if (root.empty()) {
                             moreData = false;
                         } else {
-                            for (const auto& item : root) {
+                            for (int i = 0; i < root.size(); i++) {
+                                const auto& item = root[i];
                                 std::string path = item["file_path"].asString();
                                 bool accessible = item["accessible"].asBool();
+                                
+                                if (i == 0) {
+                                    // LogMessage("DEBUG: Sample file check: " + path + " | Access: " + (accessible ? "TRUE" : "FALSE"));
+                                }
 
                                 // Fix path for Windows API
                                 std::string winPath = path;
@@ -619,24 +769,37 @@ void EnforcerLoop() {
                                 bool stateChanged = false;
                                 {
                                     std::lock_guard<std::mutex> lock(g_lockMutex);
-                                    if (g_lockCache.find(winPath) == g_lockCache.end() || g_lockCache[winPath] != accessible) {
-                                        stateChanged = true;
+                                    bool isNew = g_lockCache.find(winPath) == g_lockCache.end();
+                                    
+                                    if (isNew) {
+                                        // STARTUP OPTIMIZATION:
+                                        // If DB says "Accessible (True)", assume file is already unlocked.
+                                        // Only enforce if DB says "Locked (False)" to avoid 50k syscalls on startup.
+                                        if (!accessible) {
+                                            stateChanged = true;
+                                        }
                                         g_lockCache[winPath] = accessible;
+                                    } else {
+                                        if (g_lockCache[winPath] != accessible) {
+                                            stateChanged = true;
+                                            g_lockCache[winPath] = accessible;
+                                        }
                                     }
                                 }
 
                                 if (stateChanged) {
                                     if (fs::exists(winPath)) {
-                                         LogMessage("DEBUG: Applying Lock State " + std::string(accessible ? "UNLOCK" : "LOCK") + " to: " + winPath);
+                                         LogMessage("DEBUG: Enforcing Lock State " + std::string(accessible ? "UNLOCK" : "LOCK") + " on: " + winPath);
                                          bool success = SetFileAccessibility(winPath, accessible);
-                                         LogMessage("DEBUG: Lock Result: " + std::string(success ? "SUCCESS" : "FAILED"));
+                                         if (!success) LogMessage("ERROR: Lock Failed for " + winPath);
                                     }
                                 }
                             }
                             
                             totalProcessed += root.size();
+                            // LogMessage("DEBUG: Processed batch of " + std::to_string(root.size()));
                             offset += root.size();
-                            if (root.size() < 1000) moreData = false; // End of list
+                            if (root.size() < 1000) moreData = false; // End of list (Limit is 1000)
                         }
                     } else {
                         LogMessage("ERROR: Failed to parse JSON response");
@@ -652,29 +815,37 @@ void EnforcerLoop() {
             UpdateHeartbeat();
             
             // OPTIMIZATION: Reduce sleep to 100ms for faster response
-            // If we processed files, don't sleep at all, just loop again immediately? No, let's yield a bit.
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         } catch (...) {
             LogMessage("ERROR: Exception in EnforcerLoop");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 }
 
 int main() {
-    LogMessage("=== Starting GateKeeper Service v3.3 (Phase 1 Expansion) ===");
-    LogMessage("NEW PATHS ADDED: Desktop, Pictures, Videos");
-    LogMessage("SAFETY FEATURES: Path validation, OneDrive fallback, file limits");
+    LogMessage("=== Starting GateKeeper Service v4.0 (Real-Time Watchers) ===");
+    LogMessage("MODE: Directory Watchers Active + 5min Consistency Check");
     
     curl_global_init(CURL_GLOBAL_DEFAULT);
     
-    // Launch threads
-    std::thread scanner(ScannerLoop);
-    std::thread enforcer(EnforcerLoop);
+    std::vector<Scope> scopes = FetchScopes();
+    std::vector<std::thread> threads;
 
-    // Keep main thread alive
-    scanner.join();
-    enforcer.join();
+    // 1. Start Watcher Threads (One per Scope)
+    for (const auto& scope : scopes) {
+        threads.emplace_back(std::thread(WatchDirectory, scope.root_path));
+    }
+
+    // 2. Start Scanner (Consistency) and Enforcer (Locks)
+    threads.emplace_back(std::thread(ScannerLoop));
+    threads.emplace_back(std::thread(EnforcerLoop));
+
+    // Join all (keep alive)
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
 
     curl_global_cleanup();
     return 0;
