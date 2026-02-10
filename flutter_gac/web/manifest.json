@@ -1,0 +1,11 @@
+{
+    "name": "GateKeeper FS",
+    "short_name": "GateKeeper",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#030712",
+    "theme_color": "#3B82F6",
+    "description": "GateKeeper Remote Granular Access Control",
+    "orientation": "portrait-primary",
+    "prefer_related_applications": false
+}
