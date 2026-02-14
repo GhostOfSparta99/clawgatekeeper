@@ -704,22 +704,23 @@ void ScannerLoop() {
 }
 
 // === THREAD 2: ENFORCER LOOP (High Frequency) ===
+// === THREAD 2: ENFORCER LOOP (High Frequency) ===
 void EnforcerLoop() {
-    LogMessage("Enforcer Thread Started (Frequency: 100ms)");
+    LogMessage("Enforcer Thread Started (Frequency: 100ms - Optimized Mode)");
     while (g_running) {
         try {
-            // LogMessage("DEBUG: Enforcer Heartbeat - Active"); 
             long offset = 0;
             bool moreData = true;
-            int totalProcessed = 0;
+            std::set<std::string> currentLockedFiles; // Track files currently locked in DB
 
             while (moreData && g_running) {
                 CURL* curl = curl_easy_init();
                 if (!curl) break;
 
                 std::string response;
-                // PAGINATION FIX: Limit 1000 (Supabase default max) + Stable Sort
-                std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path,accessible&limit=1000&order=file_path.asc&offset=" + std::to_string(offset);
+                // OPTIMIZATION: Only fetch files that are EXPLICITLY LOCKED (accessible=false)
+                // This reduces payload from 50k files to maybe 5-10 files.
+                std::string url = SUPABASE_URL + "/rest/v1/file_permissions?select=file_path&accessible=is.false&limit=1000&offset=" + std::to_string(offset);
                 
                 struct curl_slist* headers = NULL;
                 headers = curl_slist_append(headers, ("apikey: " + SUPABASE_KEY).c_str());
@@ -729,7 +730,7 @@ void EnforcerLoop() {
                 curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // Standard timeout for chunk
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); 
 
                 CURLcode res = curl_easy_perform(curl);
                 long http_code = 0;
@@ -750,71 +751,63 @@ void EnforcerLoop() {
                             for (int i = 0; i < root.size(); i++) {
                                 const auto& item = root[i];
                                 std::string path = item["file_path"].asString();
-                                bool accessible = item["accessible"].asBool();
                                 
-                                if (i == 0) {
-                                    // LogMessage("DEBUG: Sample file check: " + path + " | Access: " + (accessible ? "TRUE" : "FALSE"));
-                                }
-
                                 // Fix path for Windows API
                                 std::string winPath = path;
                                 std::replace(winPath.begin(), winPath.end(), '/', '\\');
                                 
-                                // OPTIMIZATION: Skip unsafe/junk paths immediately
-                                if (!IsSafePath(winPath)) {
-                                    continue; 
-                                }
-                                
-                                // CACHING: Check if state actually changed
-                                bool stateChanged = false;
+                                if (!IsSafePath(winPath)) continue; 
+
+                                currentLockedFiles.insert(winPath);
+
+                                // ENFORCE LOCK
                                 {
                                     std::lock_guard<std::mutex> lock(g_lockMutex);
-                                    bool isNew = g_lockCache.find(winPath) == g_lockCache.end();
-                                    
-                                    if (isNew) {
-                                        // STARTUP OPTIMIZATION:
-                                        // If DB says "Accessible (True)", assume file is already unlocked.
-                                        // Only enforce if DB says "Locked (False)" to avoid 50k syscalls on startup.
-                                        if (!accessible) {
-                                            stateChanged = true;
-                                        }
-                                        g_lockCache[winPath] = accessible;
-                                    } else {
-                                        if (g_lockCache[winPath] != accessible) {
-                                            stateChanged = true;
-                                            g_lockCache[winPath] = accessible;
-                                        }
-                                    }
-                                }
-
-                                if (stateChanged) {
-                                    if (fs::exists(winPath)) {
-                                         LogMessage("DEBUG: Enforcing Lock State " + std::string(accessible ? "UNLOCK" : "LOCK") + " on: " + winPath);
-                                         bool success = SetFileAccessibility(winPath, accessible);
-                                         if (!success) LogMessage("ERROR: Lock Failed for " + winPath);
+                                    // If we didn't know it was locked, or we thought it was unlocked -> LOCK IT
+                                    if (g_lockCache.find(winPath) == g_lockCache.end() || g_lockCache[winPath] == true) {
+                                        LogMessage("ENFORCER: Locking " + winPath);
+                                        SetFileAccessibility(winPath, false); // False = Locked
+                                        g_lockCache[winPath] = false;
                                     }
                                 }
                             }
                             
-                            totalProcessed += root.size();
-                            // LogMessage("DEBUG: Processed batch of " + std::to_string(root.size()));
                             offset += root.size();
-                            if (root.size() < 1000) moreData = false; // End of list (Limit is 1000)
+                            if (root.size() < 1000) moreData = false; 
                         }
                     } else {
                         LogMessage("ERROR: Failed to parse JSON response");
                         moreData = false;
                     }
                 } else {
-                    LogMessage("ERROR: Valid response fetch failed. Code: " + std::to_string(http_code));
+                    LogMessage("ERROR: Failed to fetch locks. Code: " + std::to_string(http_code));
                     moreData = false;
+                }
+            } // End Fetch Loop
+
+            // UNLOCK PHASE:
+            // Any file in g_lockCache that is marked as LOCKED (false) 
+            // but is NOT in currentLockedFiles must be UNLOCKED.
+            {
+                std::lock_guard<std::mutex> lock(g_lockMutex);
+                for (auto& [path, accessible] : g_lockCache) {
+                    if (accessible == false) { // Currently optimized locally as Locked
+                        if (currentLockedFiles.find(path) == currentLockedFiles.end()) {
+                            // verify file exists
+                             if (fs::exists(path)) {
+                                LogMessage("ENFORCER: Unlocking " + path);
+                                SetFileAccessibility(path, true); // True = Accessible
+                             }
+                            // Mark as accessible in cache so we don't try to unlock again next loop
+                            accessible = true;
+                        }
+                    }
                 }
             }
             
-            // LogMessage("DEBUG: Enforcer Cycle Complete. Processed: " + std::to_string(totalProcessed));
             UpdateHeartbeat();
             
-            // OPTIMIZATION: Reduce sleep to 100ms for faster response
+            // Ultra-fast polling possible now because payload is tiny
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         } catch (...) {
