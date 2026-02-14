@@ -1,0 +1,25 @@
+name: gatekeeper_flutter
+description: GateKeeper Remote Granular Access Control - Flutter Edition
+publish_to: 'none'
+version: 3.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  supabase_flutter: ^2.7.0
+  provider: ^6.1.1
+  intl: ^0.18.1
+  lucide_icons: ^0.259.0
+  shared_preferences: ^2.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
